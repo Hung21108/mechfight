@@ -132,9 +132,17 @@ class MobileScavengerBot:
         self,
         enable_finishable_targeting: bool = True,
         enable_early_multi_reposition: bool = True,
+        enable_laser_peek: bool = True,
+        enable_mortar_dodge: bool = True,
+        enable_target_hysteresis: bool = False,
+        enable_route_exposure_cover: bool = False,
     ) -> None:
         self.enable_finishable_targeting = enable_finishable_targeting
         self.enable_early_multi_reposition = enable_early_multi_reposition
+        self.enable_laser_peek = enable_laser_peek
+        self.enable_mortar_dodge = enable_mortar_dodge
+        self.enable_target_hysteresis = enable_target_hysteresis
+        self.enable_route_exposure_cover = enable_route_exposure_cover
         self.slot: int = 0
         self.seed: int = 1
         self.rng = random.Random(1)
@@ -158,10 +166,14 @@ class MobileScavengerBot:
         self.retreat_substate: str = "ESCAPING"
         # Laser state machine: "IDLE", "CHARGING", "RELEASING_AT_TARGET", "HOLDING_FOR_RELEASE", "DISCHARGING_SAFE"
         self.laser_state: str = "IDLE"
+        # Current firing target lock for burst hysteresis
+        self.locked_target_id: Optional[int] = None
+        self.locked_target_since_t: float = -100.0
 
-        # Cover anchor & A* path planner state
+        # Cover anchor, laser peek-and-retreat pair, & A* path planner state
         self.anchor_pos: Optional[Tuple[float, float]] = None
         self.anchor_refresh_t: float = -100.0
+        self.peek_pair_cache: Optional[Tuple[int, float, Tuple[float, float], Tuple[float, float]]] = None
         self.current_path: List[Tuple[float, float]] = []
         self.path_goal: Optional[Tuple[float, float]] = None
         self.path_refresh_t: float = -100.0
@@ -333,6 +345,61 @@ class MobileScavengerBot:
 
         return primary_enemy, primary_enemy_dist, shooters
 
+    def compute_required_laser_charge(
+        self,
+        self_data: Dict[str, Any],
+        laser_w: Dict[str, Any],
+        target_kind: str,
+        target_hp: float,
+        target_weapons: List[str],
+        safety_margin: float = 1.08,
+    ) -> Tuple[float, float]:
+        """
+        Computes `(required_charge_seconds, max_laser_damage)` for the laser against a target.
+        Laser damage scales linearly with charge fraction `f = clamp(charge / full_charge, 0, 1)`:
+          damage(f) = max_damage * (min_frac + (1 - min_frac) * f)
+        Against enemy mechs, if `enable_laser_peek` is active and a partial charge
+        (>= `min_charge` 0.15s) deals enough damage to finish `target_hp * safety_margin`,
+        returns that early release threshold so we spend less time exposed and slowed.
+        """
+        l_stats = laser_w.get("stats", {})
+        l_cfg = self.config.get("weapons", {}).get("laser", {})
+        l_full = max(0.15, float(l_stats.get("charge", l_cfg.get("charge", 0.75))))
+        l_min_charge = max(0.05, float(l_stats.get("min_charge", l_cfg.get("min_charge", 0.15))))
+        l_min_frac = clamp(float(l_stats.get("min_frac", l_cfg.get("min_frac", 0.35))), 0.05, 0.95)
+
+        my_cubes = int(self_data.get("cubes", 0))
+        cube_cfg = self.config.get("cubes", {})
+        dmg_per_cube = float(cube_cfg.get("damage_per_cube", 0.04))
+        stat_cap = int(cube_cfg.get("stat_cap", 10))
+        cube_mult = 1.0 + dmg_per_cube * min(my_cubes, stat_cap)
+
+        max_dmg = float(l_stats.get("damage", l_cfg.get("damage", 315.0))) * cube_mult
+        if target_kind == "mech" and "mortar" in target_weapons:
+            cookoff_mult = 1.0 + float(l_stats.get("cookoff", l_cfg.get("cookoff", 0.60)))
+            max_dmg *= cookoff_mult
+
+        if target_kind in ("crate", "npc"):
+            return l_full * 0.96, max_dmg
+
+        default_req = l_full * 0.88
+        if not self.enable_laser_peek:
+            return default_req, max_dmg
+
+        needed_dmg = max(1.0, float(target_hp)) * safety_margin
+        if needed_dmg >= max_dmg * 0.92:
+            return default_req, max_dmg
+
+        # Solve linear scaling: needed_dmg / max_dmg = l_min_frac + (1 - l_min_frac) * frac
+        raw_ratio = needed_dmg / max(1.0, max_dmg)
+        if raw_ratio <= l_min_frac:
+            req_s = l_min_charge + 0.02
+        else:
+            frac = (raw_ratio - l_min_frac) / max(1e-6, 1.0 - l_min_frac)
+            req_s = max(l_min_charge + 0.02, frac * l_full)
+
+        return min(default_req, req_s), max_dmg
+
     def estimate_time_to_kill(
         self,
         self_data: Dict[str, Any],
@@ -424,34 +491,52 @@ class MobileScavengerBot:
                     else:
                         fire_t += g_cd
 
-        # 2. Laser beam schedule (hitscan: flight_s = 0, includes charge time & cook-off)
+        # 2. Laser beam schedule (hitscan: flight_s = 0, includes charge time, early lethal release & cook-off)
         _, laser_w = self.get_weapon_slot(self_data, "laser")
         if laser_w is not None:
             l_stats = laser_w.get("stats", {})
             l_range = float(l_stats.get("range", 280.0))
             if dist <= l_range:
-                l_dmg = float(l_stats.get("damage", 315.0)) * total_mult
-                if "mortar" in target.weapons:
-                    l_dmg *= 1.6
                 l_full_charge = max(0.15, float(l_stats.get("charge", 0.75)))
                 l_cd_dur = max(0.2, float(l_stats.get("cooldown", 1.65)))
                 cur_l_cd = float(laser_w.get("cooldown", 0.0))
                 cur_l_charge = float(laser_w.get("charge", 0.0))
                 short_rem = max(0.0, self.shorted_until_t - t)
 
-                # First beam release time
-                req_charge = l_full_charge * 0.90
+                req_charge, base_max_dmg = self.compute_required_laser_charge(
+                    self_data,
+                    laser_w,
+                    "mech",
+                    target.hp / rear_mult,
+                    target.weapons,
+                    safety_margin=1.08,
+                )
+                l_min_frac = float(
+                    l_stats.get(
+                        "min_frac",
+                        self.config.get("weapons", {}).get("laser", {}).get("min_frac", 0.35),
+                    )
+                )
+                charge_frac = clamp(req_charge / l_full_charge, 0.0, 1.0)
+                first_beam_dmg = (
+                    base_max_dmg
+                    * rear_mult
+                    * (l_min_frac + (1.0 - l_min_frac) * charge_frac)
+                )
+                full_beam_dmg = base_max_dmg * rear_mult * 0.94
+
                 if cur_l_charge > 0.0 and short_rem <= 0.0:
                     rem_charge = max(0.0, req_charge - cur_l_charge)
-                    # Note: releasing requires 1 decision tick (0.1s) after charge completes
                     fire_t = max(slew_delay_s, rem_charge + 0.05)
                 else:
                     start_charge_t = max(cur_l_cd, short_rem)
                     fire_t = max(slew_delay_s, start_charge_t + req_charge + 0.05)
 
+                first = True
                 while fire_t <= horizon:
-                    events.append((fire_t, l_dmg))
-                    fire_t += l_cd_dur + req_charge + 0.05
+                    events.append((fire_t, first_beam_dmg if first else full_beam_dmg))
+                    first = False
+                    fire_t += l_cd_dur + l_full_charge * 0.88 + 0.05
 
         # 3. Lightning arc schedule (instant hitscan within 45m, gated by energy)
         _, light_w = self.get_weapon_slot(self_data, "lightning")
@@ -494,6 +579,233 @@ class MobileScavengerBot:
             return 999.0
         return horizon * (target_hp / acc_dmg)
 
+    def estimate_route_exposure_damage(
+        self,
+        self_data: Dict[str, Any],
+        dest_x: float,
+        dest_y: float,
+        enemies: List[EnemyTrack],
+        waypoints: Optional[List[Tuple[float, float]]] = None,
+        total_dist_m: Optional[float] = None,
+        sample_count: int = 5,
+    ) -> Tuple[float, float, float]:
+        """
+        Estimates how long remaining `enemies` can actually shoot us along the route from
+        our current position to `(dest_x, dest_y)`, accounting for:
+          - Actual A* path geometry (when `waypoints` is given) or straight-line segment
+          - Realistic travel time using current energy reserve (`boost_speed` for the distance
+            our usable energy covers at `boost_drain`, then `walk_speed` for the rest—NO 2.5s cap!)
+          - Per-sample line-of-sight and weapon-reach checks against every surviving enemy,
+            summing each enemy's weapon DPS over the exact exposed fraction of the route.
+        Returns `(expected_damage, total_exposed_time_s, total_travel_time_s)`.
+        """
+        px, py, _ = self_data["pos"]
+        _, _, eye_h, _ = self.get_mech_dimensions(self_data)
+        stats = self_data.get("stats", {})
+        mech_cfg = self.config.get("mech", {})
+
+        walk_speed = max(4.0, float(stats.get("walk_speed", mech_cfg.get("walk_speed", 11.7))))
+        boost_speed = max(
+            walk_speed, float(stats.get("boost_speed", mech_cfg.get("boost_speed", 19.5)))
+        )
+        boost_drain = max(
+            1.0, float(stats.get("boost_drain", mech_cfg.get("boost_drain", 24.0)))
+        )
+        energy = float(self_data.get("energy", 100.0))
+        usable_energy = max(0.0, energy - 15.0)
+        boost_time_avail = usable_energy / boost_drain
+
+        # Build polyline segments along the escape route
+        pts: List[Tuple[float, float]] = [(px, py)]
+        if waypoints:
+            for wx, wy in waypoints:
+                if math.hypot(wx - pts[-1][0], wy - pts[-1][1]) > 0.5:
+                    pts.append((wx, wy))
+        if math.hypot(dest_x - pts[-1][0], dest_y - pts[-1][1]) > 0.5:
+            pts.append((dest_x, dest_y))
+
+        seg_lens: List[float] = []
+        poly_len = 0.0
+        for i in range(len(pts) - 1):
+            sl = math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+            seg_lens.append(sl)
+            poly_len += sl
+
+        dist_m = max(poly_len, float(total_dist_m) if total_dist_m is not None else 0.0)
+        if dist_m <= 0.5 or not enemies:
+            return 0.0, 0.0, 0.0
+
+        # Uncapped travel time based on real energy reserve (boost portion + walk remainder)
+        boost_dist = min(dist_m, boost_speed * boost_time_avail)
+        walk_dist = max(0.0, dist_m - boost_dist)
+        travel_time = (boost_dist / boost_speed) + (walk_dist / walk_speed)
+
+        # Sample evenly spaced points along the polyline (fractions 0.12 .. 0.88)
+        n_samp = max(2, int(sample_count))
+        sample_pts: List[Tuple[float, float]] = []
+        for k in range(n_samp):
+            frac = (k + 0.5) / n_samp
+            target_d = frac * poly_len
+            acc = 0.0
+            sx, sy = pts[-1]
+            for i, sl in enumerate(seg_lens):
+                if acc + sl >= target_d and sl > 1e-6:
+                    u = (target_d - acc) / sl
+                    sx = pts[i][0] + (pts[i + 1][0] - pts[i][0]) * u
+                    sy = pts[i][1] + (pts[i + 1][1] - pts[i][1]) * u
+                    break
+                acc += sl
+            sample_pts.append((sx, sy))
+
+        w_cfg = self.config.get("weapons", {})
+        gun_dps = float(w_cfg.get("gun", {}).get("damage", 45.0)) / max(
+            0.1, float(w_cfg.get("gun", {}).get("cooldown", 0.24))
+        )
+        light_dps = float(w_cfg.get("lightning", {}).get("damage", 60.0)) / max(
+            0.1, float(w_cfg.get("lightning", {}).get("cooldown", 0.25))
+        )
+        laser_dps = float(w_cfg.get("laser", {}).get("damage", 315.0)) / max(
+            1.0,
+            float(w_cfg.get("laser", {}).get("charge", 0.75))
+            + float(w_cfg.get("laser", {}).get("cooldown", 1.65)),
+        )
+
+        dt_per_sample = travel_time / n_samp
+        total_dmg = 0.0
+        total_exposed_s = 0.0
+
+        for sx, sy in sample_pts:
+            sz = self.world.ground_height(sx, sy) if self.world.loaded else self_data["pos"][2]
+            any_exposed = False
+            for e in enemies:
+                ed = math.hypot(sx - e.pos[0], sy - e.pos[1])
+                reach = self.get_enemy_weapon_reach(e)
+                if ed > reach:
+                    continue
+                if self.world.has_line_of_sight(
+                    sx, sy, sz + eye_h, e.pos[0], e.pos[1], e.pos[2] + 6.5
+                ):
+                    any_exposed = True
+                    e_mult = 1.0 + 0.04 * min(10, e.cubes)
+                    e_dps = gun_dps * 0.72
+                    if "lightning" in e.weapons and ed <= 46.0:
+                        e_dps += light_dps * 0.80
+                    elif "laser" in e.weapons:
+                        e_dps += laser_dps * 0.65
+                    total_dmg += e_dps * e_mult * dt_per_sample
+            if any_exposed:
+                total_exposed_s += dt_per_sample
+
+        return total_dmg, total_exposed_s, travel_time
+
+    def can_safely_commit_to_finish(
+        self,
+        self_data: Dict[str, Any],
+        zone: Dict[str, Any],
+        target: Optional[EnemyTrack],
+        firing_ttk: float,
+        shooters: List[EnemyTrack],
+        active_enemies: List[EnemyTrack],
+        t: float,
+    ) -> bool:
+        """
+        Plans the post-kill escape BEFORE committing to finish `target`:
+          1. Computes incoming damage from all active `shooters` during `firing_ttk + 0.20s`
+             (factoring in rear-armor exposure while aiming at `target`).
+          2. For multi-enemy fights, computes an actual reachable cover route from the
+             remaining enemies (`find_path_astar`), then evaluates uncapped escape exposure
+             time and damage along that route using our real energy reserve (`boost` + `walk`).
+          3. Only approves the finish if we still reach cover with enough HP for the next fight.
+        """
+        if target is None or firing_ttk > 1.35:
+            return False
+
+        px, py, pz = self_data["pos"]
+        radius, height, _, muzzle_h = self.get_mech_dimensions(self_data)
+        if not self.world.has_line_of_sight(
+            px, py, pz + muzzle_h, target.pos[0], target.pos[1], target.pos[2] + 4.5
+        ):
+            return False
+
+        hp = float(self_data.get("hp", 1400.0))
+        max_hp = max(1.0, float(self_data.get("max_hp", 1400.0)))
+        target_yaw = math.atan2(target.pos[1] - py, target.pos[0] - px)
+
+        w_cfg = self.config.get("weapons", {})
+        gun_dps = float(w_cfg.get("gun", {}).get("damage", 45.0)) / max(
+            0.1, float(w_cfg.get("gun", {}).get("cooldown", 0.24))
+        )
+        light_dps = float(w_cfg.get("lightning", {}).get("damage", 60.0)) / max(
+            0.1, float(w_cfg.get("lightning", {}).get("cooldown", 0.25))
+        )
+        laser_dmg = float(w_cfg.get("laser", {}).get("damage", 315.0))
+
+        exposure_window = firing_ttk + 0.20
+        expected_incoming_dmg = 0.0
+
+        for s in shooters:
+            sd = math.hypot(s.pos[0] - px, s.pos[1] - py)
+            s_mult = 1.0 + 0.04 * min(10, s.cubes)
+            s_yaw_from_us = math.atan2(s.pos[1] - py, s.pos[0] - px)
+            hits_our_rear = abs(angle_diff(target_yaw, s_yaw_from_us)) > (math.pi * 0.5)
+            rear_mult = 1.5 if hits_our_rear else 1.0
+
+            s_dps = gun_dps
+            if "lightning" in s.weapons and sd <= 46.0:
+                s_dps += light_dps
+            dmg_from_s = s_dps * exposure_window * s_mult * rear_mult
+            if s.charging or ("laser" in s.weapons and exposure_window >= 0.70):
+                dmg_from_s += laser_dmg * 0.75 * s_mult * rear_mult
+
+            if s.id == target.id:
+                dmg_from_s *= firing_ttk / max(0.1, exposure_window)
+            expected_incoming_dmg += dmg_from_s
+
+        remaining_enemies = [e for e in active_enemies if e.id != target.id]
+        if not remaining_enemies:
+            return (hp - expected_incoming_dmg) >= 180.0
+
+        other_shooters = [s for s in shooters if s.id != target.id]
+        if not other_shooters:
+            return (hp - expected_incoming_dmg) >= max(240.0, max_hp * 0.20)
+
+        cov_pt, cov_breaks_los, cov_reach_d = self.select_cover_anchor_with_info(
+            self_data, zone, remaining_enemies, t, force_break_los=True
+        )
+        if not cov_breaks_los or cov_reach_d > 260.0:
+            return False
+
+        # Compute route polyline & sample actual exposure along the escape path (no 2.5s cap!)
+        esc_waypoints, esc_dist = self.world.find_path_astar(
+            px,
+            py,
+            cov_pt[0],
+            cov_pt[1],
+            max_expansions=320,
+            mech_radius=radius,
+            mech_height=height,
+            smooth=True,
+            deadline_perf=self.tick_deadline_perf,
+        )
+        if not math.isfinite(esc_dist):
+            return False
+        escape_dmg, exposed_s, _ = self.estimate_route_exposure_damage(
+            self_data,
+            cov_pt[0],
+            cov_pt[1],
+            remaining_enemies,
+            waypoints=esc_waypoints,
+            total_dist_m=max(cov_reach_d, esc_dist),
+            sample_count=5,
+        )
+
+        # Account for armor upgrade damage reduction if present
+        armor_mult = float(self_data.get("stats", {}).get("damage_taken_mult", 1.0))
+        total_expected_dmg = (expected_incoming_dmg + escape_dmg) * armor_mult
+        projected_hp_after_escape = hp - total_expected_dmg
+        min_safe_hp = max(280.0, max_hp * 0.22)
+        return projected_hp_after_escape >= min_safe_hp
+
     def select_firing_target(
         self,
         self_data: Dict[str, Any],
@@ -505,15 +817,21 @@ class MobileScavengerBot:
         Separates the enemy we shoot (`firing_target`) from the enemy we defend against (`primary_threat`).
         Prefers the exposed opponent we can finish fastest based on actual simulated time-to-kill
         (including ammo, reloads, cooldowns, torso slew, and projectile flight time).
+        When `enable_target_hysteresis` is active, holds the currently locked target through a
+        gun/laser burst unless the shot closes or another target becomes clearly easier to finish.
         Returns (firing_target, estimated_time_to_kill_s, is_kill_imminent).
         """
         if not active_enemies:
+            self.locked_target_id = None
             return None, 999.0, False
 
         px, py, pz = self_data["pos"]
         _, _, _, muzzle_h = self.get_mech_dimensions(self_data)
         mz = pz + muzzle_h
         actual_yaw = float(self_data.get("aim", [0.0, 0.0])[0])
+
+        _, laser_w = self.get_weapon_slot(self_data, "laser")
+        laser_charging = bool(laser_w and float(laser_w.get("charge", 0.0)) > 0.0)
 
         best_target: Optional[EnemyTrack] = None
         best_score = -1e9
@@ -530,8 +848,6 @@ class MobileScavengerBot:
             )
             ttk = self.estimate_time_to_kill(self_data, e, t)
 
-            # A kill is only imminent if we have clear line of sight right now
-            # and lethal damage will actually land on the target within 1.15 seconds.
             kill_imminent = has_los and (ttk <= 1.15)
 
             score = 220.0 - min(20.0, ttk) * 15.0 - ed * 0.35
@@ -552,6 +868,16 @@ class MobileScavengerBot:
             if primary_threat is not None and e.id == primary_threat.id:
                 score += 18.0
 
+            # Burst target hysteresis: hold current target while it still has clear LOS,
+            # especially while a laser charge is active, so nearly-tied targets don't cause wasted turns
+            if (
+                self.enable_target_hysteresis
+                and self.locked_target_id is not None
+                and e.id == self.locked_target_id
+                and has_los
+            ):
+                score += 55.0 if laser_charging else 32.0
+
             if (score > best_score + 1e-6) or (
                 abs(score - best_score) <= 1e-6
                 and best_target is not None
@@ -561,6 +887,13 @@ class MobileScavengerBot:
                 best_target = e
                 best_ttk = ttk
                 best_imminent = kill_imminent
+
+        if best_target is not None:
+            if best_target.id != self.locked_target_id:
+                self.locked_target_id = best_target.id
+                self.locked_target_since_t = t
+        else:
+            self.locked_target_id = None
 
         return best_target, best_ttk, best_imminent
 
@@ -575,6 +908,11 @@ class MobileScavengerBot:
         zone: Dict[str, Any],
         enemies: List[EnemyTrack],
     ) -> Optional[int]:
+        """
+        Scores upgrade choices primarily by exact upgrade ID (and structured
+        `config.upgrades` stat effects if present), preventing text collisions like
+        "energy regen" (Reactor Tune) falsely matching HP regeneration (Repair Nanites).
+        """
         if not offer or "choices" not in offer:
             return None
         choices = offer["choices"]
@@ -591,56 +929,117 @@ class MobileScavengerBot:
             math.hypot(e.pos[0] - self_data["pos"][0], e.pos[1] - self_data["pos"][1]) < 60.0
             for e in enemies
         )
+        sustained_pressure = late_game or close_pressure or (hp_frac < 0.65)
 
         has_laser = self.get_weapon_slot(self_data, "laser")[0] is not None
         has_lightning = self.get_weapon_slot(self_data, "lightning")[0] is not None
+
+        # Explicit base priority table by exact upgrade ID
+        id_priority: Dict[str, float] = {
+            # Healing / Repair Nanites (reduces regen delay 5s -> 2s, boosts HP/s 45 -> 115)
+            "nanites": 110.0,
+            "repair_nanites": 110.0,
+            "regen": 110.0,
+            "hp_regen": 110.0,
+            # Armor & Hull Plating (top priority under sustained close pressure)
+            "armor": 106.0 if sustained_pressure else 82.0,
+            "reactive_armor": 106.0 if sustained_pressure else 82.0,
+            "plating": 102.0 if sustained_pressure else 78.0,
+            "hull": 102.0 if sustained_pressure else 78.0,
+            "max_hp": 102.0 if sustained_pressure else 78.0,
+            "health": 102.0 if sustained_pressure else 78.0,
+            # Movement speed / leg servos
+            "speed": 92.0,
+            "walk_speed": 92.0,
+            "servos": 92.0,
+            "leg_servos": 92.0,
+            "legs": 92.0,
+            "stride": 92.0,
+            "mobility": 92.0,
+            # Laser upgrades (high value when holding laser in early/mid game)
+            "laser_damage": 88.0 if (has_laser and not late_game) else (62.0 if has_laser else 20.0),
+            "laser_charge": 86.0 if (has_laser and not late_game) else (60.0 if has_laser else 20.0),
+            "laser_rate": 84.0 if (has_laser and not late_game) else (58.0 if has_laser else 20.0),
+            "laser": 85.0 if (has_laser and not late_game) else (60.0 if has_laser else 20.0),
+            # Lightning upgrades
+            "lightning_damage": 88.0 if (has_lightning or (late_game and self.preferred_secondary == "lightning")) else 32.0,
+            "lightning_range": 86.0 if (has_lightning or (late_game and self.preferred_secondary == "lightning")) else 30.0,
+            "lightning_chain": 84.0 if (has_lightning or (late_game and self.preferred_secondary == "lightning")) else 28.0,
+            "lightning": 85.0 if (has_lightning or (late_game and self.preferred_secondary == "lightning")) else 30.0,
+            # Energy / Reactor Tune (strictly below Nanites, Speed, and Armor!)
+            "reactor": 68.0,
+            "reactor_tune": 68.0,
+            "energy": 68.0,
+            "energy_regen": 68.0,
+            "capacitor": 66.0,
+            "boost": 66.0,
+            # Arm gun upgrades
+            "gun_damage": 74.0,
+            "gun_rate": 72.0,
+            "gun_reload": 64.0,
+            "gun_mag": 60.0,
+            "gun_speed": 62.0,
+            # Sensors & Gyros
+            "sensors": 54.0,
+            "turn_rate": 52.0,
+            "gyros": 52.0,
+        }
 
         best_idx = 0
         best_score = -1e9
 
         for idx, ch in enumerate(choices):
-            cid = str(ch.get("id", "")).lower()
-            cname = str(ch.get("name", "")).lower()
-            cdesc = str(ch.get("desc", "")).lower()
-            text = f"{cid} {cname} {cdesc}"
+            cid = str(ch.get("id", "")).strip().lower()
+            cname = str(ch.get("name", "")).strip().lower()
+            cdesc = str(ch.get("desc", "")).strip().lower()
 
-            score = 0.0
+            if cid in id_priority:
+                score = id_priority[cid]
+            else:
+                # Disambiguate by ID tokens and name/desc while separating energy regen from HP regen
+                text = f"{cid} {cname} {cdesc}"
+                is_energy_upgrade = (
+                    "energy" in cid
+                    or "reactor" in cid
+                    or "capacitor" in cid
+                    or "energy" in cname
+                    or "reactor" in cname
+                    or "energy regen" in cdesc
+                )
+                is_hp_regen = (
+                    "nanite" in text
+                    or "repair" in text
+                    or ("regen" in text and not is_energy_upgrade)
+                )
 
-            if "nanite" in text or "regen" in text or "repair" in text:
-                score += 100.0
-
-            if "walk" in text or "speed" in text or "leg" in text or "servo" in text or "stride" in text:
-                if "projectile" not in text and "shell" not in text and "bullet" not in text:
-                    score += 80.0
-            if "energy" in text or "capacitor" in text or "boost" in text or "reactor" in text:
-                score += 65.0
-
-            if "armor" in text or "damage taken" in text or "plating" in text:
-                score += 85.0 if (late_game or close_pressure or hp_frac < 0.65) else 62.0
-            if "max hp" in text or "hull" in text or "health" in text or "structure" in text:
-                score += 82.0 if (late_game or close_pressure or hp_frac < 0.65) else 58.0
-
-            if "laser" in text or "charge" in text or "beam" in text:
-                if has_laser and not late_game and hp_frac >= 0.65:
-                    score += 74.0
-                elif has_laser:
-                    score += 48.0
+                score = 0.0
+                if is_hp_regen:
+                    score = 110.0
+                elif "armor" in cid or "damage taken" in cdesc or "armor" in cname:
+                    score = 106.0 if sustained_pressure else 82.0
+                elif "hp" in cid or "hull" in cid or "plating" in cname or "max hp" in cdesc:
+                    score = 102.0 if sustained_pressure else 78.0
+                elif (
+                    "walk" in cid
+                    or "speed" in cid
+                    or "servo" in text
+                    or "walk speed" in cdesc
+                ) and "gun" not in cid and "proj" not in cid:
+                    score = 92.0
+                elif "laser" in cid or "laser" in cname:
+                    score = 86.0 if (has_laser and not late_game) else (60.0 if has_laser else 20.0)
+                elif "lightning" in cid or "lightning" in cname or "arc" in cname:
+                    score = 86.0 if (has_lightning or (late_game and self.preferred_secondary == "lightning")) else 30.0
+                elif "gun" in cid or "rotary" in cname or "arm gun" in cdesc:
+                    score = 72.0
+                elif is_energy_upgrade:
+                    score = 68.0
+                elif "sensor" in text or "vision" in text:
+                    score = 54.0
+                elif "turn" in text or "gyro" in text:
+                    score = 52.0
                 else:
-                    score += 15.0
-
-            if "lightning" in text or "arc" in text or "chain" in text:
-                if has_lightning or (late_game and self.preferred_secondary == "lightning"):
-                    score += 76.0
-                else:
-                    score += 30.0
-
-            if "gun" in text or "rotary" in text or "fire rate" in text or "ammo" in text or "reload" in text:
-                score += 55.0
-
-            if "sensor" in text or "vision" in text or "proximity" in text:
-                score += 50.0
-            if "turn" in text or "gyro" in text or "torso" in text:
-                score += 45.0
+                    score = 40.0
 
             if score > best_score:
                 best_score = score
@@ -908,8 +1307,9 @@ class MobileScavengerBot:
     ) -> bool:
         """
         Checks whether collecting a reward at (lx, ly, lz) is safe:
-        - Rejects loot if any surviving enemy has clear line of sight to (lx, ly) within 165m
-          or is closer to the loot than we are.
+        - Rejects loot if any surviving enemy has clear line of sight to (lx, ly) within 165m.
+        - Rejects loot if an enemy is within 18m (or within 42m with LOS), or is closer to the
+          loot than we are while having a clear line of sight to the loot.
         - If enemies are tracked nearby, requires the loot to be within a quick dash
           (`max_safe_travel_m`) so we can grab it and return to cover before the squad closes.
         """
@@ -922,13 +1322,17 @@ class MobileScavengerBot:
 
         for e in enemies:
             ed = math.hypot(lx - e.pos[0], ly - e.pos[1])
-            if ed < 42.0 or (ed < my_dist + 8.0 and ed < 95.0):
-                return False
+            has_los_to_loot = False
             if ed < 165.0:
-                if self.world.has_line_of_sight(
+                has_los_to_loot = self.world.has_line_of_sight(
                     lx, ly, lz + eye_h * 0.75, e.pos[0], e.pos[1], e.pos[2] + 6.5
-                ):
-                    return False
+                )
+            if has_los_to_loot:
+                return False
+            # Even without LOS (enemy behind a wall), don't walk into a cube if the enemy
+            # is right on the other side of a corner (< 18m) or much closer to it than we are
+            if ed < 18.0 or (ed + 6.0 < my_dist and ed < 50.0):
+                return False
         return True
 
     def select_cover_anchor_with_info(
@@ -1110,19 +1514,51 @@ class MobileScavengerBot:
             evaluated += 1
             escape_bonus = 25.0 if (2 <= escapes <= 6) else 10.0
             euclid_d = math.hypot(cand_x - px, cand_y - py)
-            reach_d = self.world.reachable_distance(
-                px,
-                py,
-                cand_x,
-                cand_y,
-                max_expansions=260,
-                mech_radius=radius,
-                mech_height=height,
-                deadline_perf=self.tick_deadline_perf,
+            route_penalty = 0.0
+            if self.enable_route_exposure_cover and enemies:
+                cand_waypoints, reach_d = self.world.find_path_astar(
+                    px,
+                    py,
+                    cand_x,
+                    cand_y,
+                    max_expansions=260,
+                    mech_radius=radius,
+                    mech_height=height,
+                    smooth=True,
+                    deadline_perf=self.tick_deadline_perf,
+                )
+                if reach_d > 300.0:
+                    continue
+                route_dmg, _, _ = self.estimate_route_exposure_damage(
+                    self_data,
+                    cand_x,
+                    cand_y,
+                    enemies,
+                    waypoints=cand_waypoints,
+                    total_dist_m=reach_d,
+                    sample_count=4,
+                )
+                # Penalize routes crossing enemy firing lanes so a slightly longer wall-hugged
+                # route beats a shorter sprint through crossfire
+                route_penalty = route_dmg * (0.42 if force_break_los else 0.25)
+            else:
+                reach_d = self.world.reachable_distance(
+                    px,
+                    py,
+                    cand_x,
+                    cand_y,
+                    max_expansions=260,
+                    mech_radius=radius,
+                    mech_height=height,
+                    deadline_perf=self.tick_deadline_perf,
+                )
+                if reach_d > 300.0:
+                    continue
+            true_score = (
+                (base_s + euclid_d * 0.35 + escape_bonus)
+                - reach_d * 0.55
+                - route_penalty
             )
-            if reach_d > 300.0:
-                continue
-            true_score = (base_s + euclid_d * 0.35 + escape_bonus) - reach_d * 0.55
             if true_score > best_score:
                 best_score = true_score
                 best_pt = (cand_x, cand_y)
@@ -1132,6 +1568,205 @@ class MobileScavengerBot:
         self.anchor_pos = best_pt
         self.anchor_refresh_t = t
         return best_pt, best_hidden, best_reach_d
+
+    def select_laser_peek_pair(
+        self,
+        self_data: Dict[str, Any],
+        zone: Dict[str, Any],
+        target: EnemyTrack,
+        enemies: List[EnemyTrack],
+        t: float,
+    ) -> Optional[Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """
+        Finds a tight, coordinated pair of nearby positions around a building/cover corner:
+          - `cover_pt`: blocks line of sight from all enemy shooters (safe to charge laser & wait out cooldown)
+          - `peek_pt`: the NEAREST walkable step clearing the corner (3.5..10.5m from `cover_pt`)
+            that exposes a clear firing line to `target` while blocking other enemies where possible,
+            so the mech can easily walk out at half charging speed well before `hold_s` auto-fires.
+        Caches the pair for up to 1.2s while both spots remain valid.
+        """
+        px, py, pz = self_data["pos"]
+        radius, height, eye_h, muzzle_h = self.get_mech_dimensions(self_data)
+        tx, ty, tz = target.pos[0], target.pos[1], target.pos[2] + 4.5
+
+        stats = self_data.get("stats", {})
+        mech_cfg = self.config.get("mech", {})
+        walk_speed = float(stats.get("walk_speed", mech_cfg.get("walk_speed", 11.7)))
+        charge_move_speed = max(3.0, walk_speed * 0.5)
+        # Keep the cover->peek step short enough to traverse at half charging speed in <= ~1.6s
+        max_peek_step = min(11.0, charge_move_speed * 1.75)
+
+        if self.peek_pair_cache is not None:
+            cid, c_time, cov_pt, pk_pt = self.peek_pair_cache
+            if (
+                cid == target.id
+                and (t - c_time) < 1.2
+                and math.hypot(pk_pt[0] - cov_pt[0], pk_pt[1] - cov_pt[1]) <= max_peek_step + 0.5
+                and self.is_inside_zone(cov_pt[0], cov_pt[1], zone, margin=10.0)
+                and self.is_inside_zone(pk_pt[0], pk_pt[1], zone, margin=10.0)
+            ):
+                cov_z = self.world.ground_height(cov_pt[0], cov_pt[1])
+                pk_z = self.world.ground_height(pk_pt[0], pk_pt[1])
+                cov_hidden = not self.world.has_line_of_sight(
+                    cov_pt[0], cov_pt[1], cov_z + eye_h, tx, ty, tz
+                )
+                pk_has_los = self.world.has_line_of_sight(
+                    pk_pt[0], pk_pt[1], pk_z + muzzle_h, tx, ty, tz
+                )
+                if cov_hidden and pk_has_los:
+                    return cov_pt, pk_pt
+
+        if not self.world.loaded:
+            return None
+
+        best_pair: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        best_score = -1e9
+
+        # Candidate cover spots near nearby buildings, corners, or current position
+        cover_candidates: List[Tuple[float, float]] = [(px, py)]
+        if self.anchor_pos is not None:
+            cover_candidates.append(self.anchor_pos)
+
+        for b in self.world.cover_buildings:
+            dist_b = math.hypot(b.cx - px, b.cy - py)
+            if dist_b > 75.0:
+                continue
+            if not self.is_inside_zone(b.cx, b.cy, zone, margin=12.0):
+                continue
+            away_yaw = math.atan2(b.cy - ty, b.cx - tx)
+            # Sample right near building corners (where a short 3.5-8m lateral step clears LOS)
+            hx = 0.5 * (b.max_x - b.min_x) + radius + 2.2
+            hy = 0.5 * (b.max_y - b.min_y) + radius + 2.2
+            for sx in (-1.0, 1.0):
+                for sy in (-1.0, 1.0):
+                    cover_candidates.append((b.cx + sx * hx, b.cy + sy * hy))
+            half_w = 0.5 * max(b.max_x - b.min_x, b.max_y - b.min_y) + radius + 2.5
+            for off in (0.0, 0.55, -0.55):
+                ang = away_yaw + off
+                cx_cand = b.cx + math.cos(ang) * half_w
+                cy_cand = b.cy + math.sin(ang) * half_w
+                cover_candidates.append((cx_cand, cy_cand))
+
+        step_distances = [d for d in (4.0, 6.0, 8.0, 10.5) if d <= max_peek_step + 0.5]
+        if not step_distances:
+            step_distances = [4.0, 6.0]
+
+        for cov_x, cov_y in cover_candidates:
+            if not self.is_inside_zone(cov_x, cov_y, zone, margin=10.0):
+                continue
+            cov_d = math.hypot(cov_x - px, cov_y - py)
+            if cov_d > 55.0:
+                continue
+            cov_z = self.world.ground_height(cov_x, cov_y)
+            if self.world.is_point_blocked(cov_x, cov_y, cov_z, radius, height):
+                continue
+
+            # `cover_pt` must block line of sight to the primary target
+            if self.world.has_line_of_sight(
+                cov_x, cov_y, cov_z + eye_h, tx, ty, tz
+            ):
+                continue
+
+            # Count how many other enemies are blocked at cover_pt
+            other_exposed_at_cov = 0
+            for e in enemies:
+                if e.id == target.id:
+                    continue
+                if self.world.has_line_of_sight(
+                    cov_x, cov_y, cov_z + eye_h, e.pos[0], e.pos[1], e.pos[2] + 5.5
+                ):
+                    other_exposed_at_cov += 1
+            if other_exposed_at_cov > 0:
+                continue
+
+            # Sample short step-out (`peek_pt`) positions from `cover_pt` favoring the nearest
+            # point that clears the corner (checked in ascending distance order).
+            to_target_yaw = math.atan2(ty - cov_y, tx - cov_x)
+            found_for_this_cover = False
+            for step_d in step_distances:
+                for lat_sign in (1.0, -1.0):
+                    for ang_off in (
+                        0.45 * lat_sign,
+                        0.75 * lat_sign,
+                        1.05 * lat_sign,
+                        1.35 * lat_sign,
+                    ):
+                        pk_ang = to_target_yaw + ang_off
+                        pk_x = cov_x + math.cos(pk_ang) * step_d
+                        pk_y = cov_y + math.sin(pk_ang) * step_d
+                        if not self.is_inside_zone(pk_x, pk_y, zone, margin=10.0):
+                            continue
+                        pk_z = self.world.ground_height(pk_x, pk_y)
+                        if self.world.is_point_blocked(pk_x, pk_y, pk_z, radius, height):
+                            continue
+                        if not self.world.is_walkable_segment_2d(
+                            cov_x,
+                            cov_y,
+                            pk_x,
+                            pk_y,
+                            mech_radius=radius,
+                            mech_height=height,
+                            step_m=1.6,
+                        ):
+                            continue
+                        if not self.world.has_line_of_sight(
+                            pk_x, pk_y, pk_z + muzzle_h, tx, ty, tz
+                        ):
+                            continue
+
+                        # Refine to the closest point along cover->peek that first gains LOS
+                        refined_x, refined_y = pk_x, pk_y
+                        refined_step = step_d
+                        for frac in (0.55, 0.72, 0.86):
+                            rx = cov_x + (pk_x - cov_x) * frac
+                            ry = cov_y + (pk_y - cov_y) * frac
+                            rz = self.world.ground_height(rx, ry)
+                            if (
+                                not self.world.is_point_blocked(rx, ry, rz, radius, height)
+                                and self.world.has_line_of_sight(
+                                    rx, ry, rz + muzzle_h, tx, ty, tz
+                                )
+                            ):
+                                refined_x, refined_y = rx, ry
+                                refined_step = step_d * frac
+                                break
+
+                        pk_z = self.world.ground_height(refined_x, refined_y)
+                        other_shooters_at_peek = 0
+                        for e in enemies:
+                            if e.id == target.id:
+                                continue
+                            ed = math.hypot(refined_x - e.pos[0], refined_y - e.pos[1])
+                            if ed <= self.get_enemy_weapon_reach(e) and self.world.has_line_of_sight(
+                                refined_x,
+                                refined_y,
+                                pk_z + eye_h,
+                                e.pos[0],
+                                e.pos[1],
+                                e.pos[2] + 5.5,
+                            ):
+                                other_shooters_at_peek += 1
+
+                        target_d = math.hypot(refined_x - tx, refined_y - ty)
+                        range_bonus = 25.0 if (65.0 <= target_d <= 165.0) else 0.0
+                        # Strongly favor short cover->peek steps so we spend minimal time slowed by charging
+                        pair_score = (
+                            140.0
+                            + range_bonus
+                            - cov_d * 0.85
+                            - refined_step * 4.0
+                            - other_shooters_at_peek * 85.0
+                        )
+                        if pair_score > best_score:
+                            best_score = pair_score
+                            best_pair = ((cov_x, cov_y), (refined_x, refined_y))
+                            found_for_this_cover = True
+                if found_for_this_cover:
+                    break
+
+        if best_pair is not None:
+            self.peek_pair_cache = (target.id, t, best_pair[0], best_pair[1])
+        return best_pair
 
     def select_cover_anchor(
         self,
@@ -1145,6 +1780,229 @@ class MobileScavengerBot:
             self_data, zone, enemies, t, force_break_los=force_break_los
         )
         return pt
+
+    def evaluate_mortar_dodge(
+        self,
+        obs: Dict[str, Any],
+        self_data: Dict[str, Any],
+        zone: Dict[str, Any],
+    ) -> Optional[Tuple[float, float, bool]]:
+        """
+        Inspects visible mortar projectiles (`obs.projectiles` where `kind == "mortar"`),
+        predicts their impact point and landing time under `weapons.mortar.gravity`,
+        and if our mech (or current trajectory) falls inside the blast radius + mech radius,
+        evaluates candidate dodge moves across full and shorter step lengths, selecting the
+        walkable move inside (or closest to) the safe zone that minimizes expected
+        blast damage + concussion + zone damage.
+        Returns `(dodge_target_x, dodge_target_y, need_boost)` or `None` if no dodge is required.
+        """
+        if not self.enable_mortar_dodge:
+            return None
+
+        projectiles = obs.get("projectiles", [])
+        if not projectiles:
+            return None
+
+        px, py, pz = self_data["pos"]
+        vx, vy, _ = self_data.get("vel", [0.0, 0.0, 0.0])
+        radius, height, _, _ = self.get_mech_dimensions(self_data)
+
+        w_cfg = self.config.get("weapons", {}).get("mortar", {})
+        grav = max(1.0, float(w_cfg.get("gravity", 22.0)))
+        splash_r = float(w_cfg.get("splash_radius", 7.0))
+        direct_dmg = float(w_cfg.get("damage", 200.0))
+        splash_dmg = float(w_cfg.get("splash", 160.0))
+        safe_clear_r = splash_r + radius + 1.8
+
+        stats = self_data.get("stats", {})
+        mech_cfg = self.config.get("mech", {})
+        walk_speed = float(stats.get("walk_speed", mech_cfg.get("walk_speed", 11.7)))
+        boost_speed = float(stats.get("boost_speed", mech_cfg.get("boost_speed", 19.5)))
+        energy = float(self_data.get("energy", 100.0))
+
+        cx, cy = zone.get("center", [0.0, 0.0])
+        cur_r = float(zone.get("radius", 560.0))
+        zone_dps = float(zone.get("dps", 20.0))
+
+        # Collect threatening mortar shells landing within 3.0s
+        threats: List[Tuple[float, float, float, float, float, float]] = []
+        for proj in projectiles:
+            if proj.get("kind") != "mortar":
+                continue
+            spos = proj.get("pos")
+            svel = proj.get("vel")
+            if not spos or not svel:
+                continue
+            sx, sy, sz = float(spos[0]), float(spos[1]), float(spos[2])
+            svx, svy, svz = float(svel[0]), float(svel[1]), float(svel[2])
+
+            est_gz = self.world.ground_height(sx, sy) if self.world.loaded else pz
+            t_hit = 0.0
+            for _ in range(2):
+                dz = sz - est_gz
+                disc = svz * svz + 2.0 * grav * max(0.0, dz)
+                t_hit = max(0.05, (svz + math.sqrt(max(0.0, disc))) / grav)
+                imp_x = sx + svx * t_hit
+                imp_y = sy + svy * t_hit
+                if self.world.loaded:
+                    est_gz = self.world.ground_height(imp_x, imp_y)
+
+            if t_hit > 3.0:
+                continue
+
+            imp_x = sx + svx * t_hit
+            imp_y = sy + svy * t_hit
+            dist_now = math.hypot(imp_x - px, imp_y - py)
+            fut_x = px + vx * min(t_hit, 1.0)
+            fut_y = py + vy * min(t_hit, 1.0)
+            dist_fut = math.hypot(imp_x - fut_x, imp_y - fut_y)
+
+            if min(dist_now, dist_fut) < safe_clear_r:
+                threats.append((imp_x, imp_y, est_gz, t_hit, svx, svy))
+
+        if not threats:
+            return None
+
+        threats.sort(key=lambda item: item[3])
+        imp_x, imp_y, imp_z, t_hit, svx, svy = threats[0]
+
+        shell_yaw = math.atan2(svy, svx)
+        away_imp_yaw = math.atan2(py - imp_y, px - imp_x)
+        to_center_yaw = math.atan2(cy - py, cx - px)
+        cand_angles: List[float] = [
+            away_imp_yaw,
+            to_center_yaw,
+            shell_yaw + math.pi * 0.5,
+            shell_yaw - math.pi * 0.5,
+            away_imp_yaw + 0.55,
+            away_imp_yaw - 0.55,
+            away_imp_yaw + 1.1,
+            away_imp_yaw - 1.1,
+            shell_yaw + math.pi,
+            shell_yaw,
+        ]
+
+        eff_t = max(0.15, t_hit - 0.10)
+        walk_reach = walk_speed * eff_t
+        boost_reach = boost_speed * eff_t if energy >= 12.0 else walk_reach
+
+        # Helper: estimate expected total damage (mortar blast + zone burn) for landing at (rx, ry)
+        def expected_damage_at(rx: float, ry: float, used_boost: bool) -> float:
+            dmg = 0.0
+            for tx_i, ty_i, _, _, _, _ in threats:
+                d_imp = math.hypot(rx - tx_i, ry - ty_i)
+                # Direct cylinder hit vs splash radius falloff (1.0 -> 0.3 at splash_radius)
+                if d_imp <= radius + 0.4:
+                    dmg += direct_dmg + splash_dmg
+                elif d_imp <= splash_r + radius:
+                    eff_d = max(0.0, d_imp - radius)
+                    falloff = max(0.3, 1.0 - 0.7 * (eff_d / max(0.1, splash_r)))
+                    # Include small penalty for concussion energy drain + knockback
+                    dmg += (splash_dmg + 45.0) * falloff
+            # Zone damage penalty if stepping outside the current circle
+            dist_from_center = math.hypot(rx - cx, ry - cy)
+            if dist_from_center > cur_r - 0.5:
+                over_m = dist_from_center - (cur_r - 0.5)
+                # Time spent outside getting back in (at least 0.6s plus return walk time)
+                outside_s = 0.6 + (over_m / max(4.0, walk_speed)) * 1.5
+                dmg += zone_dps * outside_s + 40.0
+            if used_boost:
+                dmg += 8.0  # Small tie-breaker preference to save energy when walking suffices
+            return dmg
+
+        # Adaptive zone margin: never forbid moves inside a tiny final circle (e.g. radius 6m)
+        safe_zone_margin = min(4.0, max(0.3, cur_r * 0.15))
+        max_step = max(8.0, min(16.0, safe_clear_r + 2.5))
+        # Try standard dodge step first, then progressively shorter steps for tight final circles
+        step_tiers = [max_step, 7.0, 4.5, 2.5]
+
+        best_goal: Optional[Tuple[float, float]] = None
+        best_cost = 1e9
+        best_need_boost = False
+
+        # Include staying near current spot or stepping right to zone center as safe baseline candidates
+        baseline_pts: List[Tuple[float, float]] = [(px, py)]
+        if math.hypot(cx - px, cy - py) > 0.5:
+            baseline_pts.append((cx, cy))
+        for bx, by in baseline_pts:
+            if not self.world.is_walkable_segment_2d(
+                px, py, bx, by, mech_radius=radius, mech_height=height, step_m=1.6
+            ):
+                continue
+            d_b = math.hypot(bx - px, by - py)
+            if d_b <= 0.1:
+                c = expected_damage_at(px, py, False)
+                if c < best_cost:
+                    best_cost = c
+                    best_goal = (px, py)
+                    best_need_boost = False
+            else:
+                ux, uy = (bx - px) / d_b, (by - py) / d_b
+                wx, wy = px + ux * min(d_b, walk_reach), py + uy * min(d_b, walk_reach)
+                cw = expected_damage_at(wx, wy, False)
+                if cw < best_cost:
+                    best_cost = cw
+                    best_goal = (bx, by)
+                    best_need_boost = False
+                if boost_reach > walk_reach + 0.5:
+                    bsx, bsy = px + ux * min(d_b, boost_reach), py + uy * min(d_b, boost_reach)
+                    cb = expected_damage_at(bsx, bsy, True)
+                    if cb < best_cost:
+                        best_cost = cb
+                        best_goal = (bx, by)
+                        best_need_boost = True
+
+        # Search full and shorter step tiers strictly inside the safe circle first
+        for require_inside in (True, False):
+            found_clear_inside = False
+            for step_dist in step_tiers:
+                for ang in cand_angles:
+                    ca = math.cos(ang)
+                    sa = math.sin(ang)
+                    cand_x = px + ca * step_dist
+                    cand_y = py + sa * step_dist
+
+                    if require_inside and not self.is_inside_zone(
+                        cand_x, cand_y, zone, margin=safe_zone_margin
+                    ):
+                        continue
+                    if not self.world.is_walkable_segment_2d(
+                        px, py, cand_x, cand_y, mech_radius=radius, mech_height=height, step_m=1.6
+                    ):
+                        continue
+
+                    vel_bonus = (ca * vx + sa * vy) * 0.4
+
+                    walk_x = px + ca * min(step_dist, walk_reach)
+                    walk_y = py + sa * min(step_dist, walk_reach)
+                    walk_cost = expected_damage_at(walk_x, walk_y, False) - vel_bonus
+                    if walk_cost < best_cost:
+                        best_cost = walk_cost
+                        best_goal = (cand_x, cand_y)
+                        best_need_boost = False
+                        if require_inside and walk_cost < 5.0:
+                            found_clear_inside = True
+
+                    if boost_reach > walk_reach + 0.5:
+                        boost_x = px + ca * min(step_dist, boost_reach)
+                        boost_y = py + sa * min(step_dist, boost_reach)
+                        boost_cost = expected_damage_at(boost_x, boost_y, True) - vel_bonus
+                        if boost_cost < best_cost:
+                            best_cost = boost_cost
+                            best_goal = (cand_x, cand_y)
+                            best_need_boost = True
+                            if require_inside and boost_cost < 15.0:
+                                found_clear_inside = True
+
+                if found_clear_inside:
+                    break
+            # If we already found an inside-zone dodge that clears the blast, don't consider leaving the zone
+            if found_clear_inside:
+                break
+
+        if best_goal is None:
+            return None
+        return (best_goal[0], best_goal[1], best_need_boost)
 
     def compute_navigation_move(
         self,
@@ -1213,14 +2071,16 @@ class MobileScavengerBot:
                 return [round(self.unstuck_dir[0], 4), round(self.unstuck_dir[1], 4)], []
 
         # 3. Replan A* path when goal changes or periodic refresh expires
+        same_goal = self.path_goal is not None and math.hypot(
+            goal_x - self.path_goal[0], goal_y - self.path_goal[1]
+        ) <= 6.0
         need_replan = (
-            self.path_goal is None
-            or math.hypot(goal_x - self.path_goal[0], goal_y - self.path_goal[1]) > 6.0
+            not same_goal
             or not self.current_path
             or (t - self.path_refresh_t) > 1.5
         )
         if need_replan:
-            waypoints, _ = self.world.find_path_astar(
+            waypoints, path_dist = self.world.find_path_astar(
                 px,
                 py,
                 goal_x,
@@ -1231,9 +2091,15 @@ class MobileScavengerBot:
                 smooth=True,
                 deadline_perf=self.tick_deadline_perf,
             )
-            self.current_path = waypoints
-            self.path_goal = (goal_x, goal_y)
-            self.path_refresh_t = t
+            complete = math.isfinite(path_dist)
+            cached_path_remaining = same_goal and self.current_path and math.hypot(
+                self.current_path[-1][0] - px, self.current_path[-1][1] - py
+            ) > 1.2
+            if complete or not cached_path_remaining:
+                self.current_path = waypoints
+                self.path_goal = (goal_x, goal_y)
+            # Keep following a usable route when a refresh times out, then retry next tick.
+            self.path_refresh_t = t if complete else -math.inf
 
         # Advance past reached waypoints
         while len(self.current_path) > 1:
@@ -1563,6 +2429,8 @@ class MobileScavengerBot:
             self.enemy_tracks.pop(kid, None)
             if self.last_damaged_by == kid:
                 self.last_damaged_by = None
+            if self.locked_target_id == kid:
+                self.locked_target_id = None
 
         if not in_zone:
             self.last_damaged_t = t
@@ -1660,23 +2528,33 @@ class MobileScavengerBot:
                 stronger_closing = True
 
         # Reposition as soon as a second enemy can shoot us (threatening_enemies_count >= 2)
-        # even at 100% HP, UNLESS a kill on our firing target is imminent and our HP is healthy enough to finish it.
+        # even at 100% HP, UNLESS a kill on our firing target is imminent and expected incoming
+        # damage + escape cover distance show we can finish the kill and survive.
+        can_commit_finish = kill_imminent and self.can_safely_commit_to_finish(
+            self_data,
+            zone,
+            firing_enemy,
+            firing_ttk,
+            shooters,
+            active_enemies,
+            t,
+        )
         if self.enable_early_multi_reposition:
-            multi_shooter_pressure = threatening_enemies_count >= 2 and not (
-                kill_imminent and hp_frac >= 0.45
+            multi_shooter_pressure = (
+                threatening_enemies_count >= 2 and not can_commit_finish
             )
         else:
             multi_shooter_pressure = threatening_enemies_count >= 2 and hp_frac < 0.85
         low_hp_retreat = (
             hp_frac < 0.62
             and (active_enemies or (t - self.last_damaged_t) < 4.0)
-            and not (kill_imminent and hp_frac >= 0.38 and threatening_enemies_count <= 1)
+            and not (can_commit_finish and threatening_enemies_count <= 1)
         )
 
         should_enter_retreat = (
             low_hp_retreat
             or multi_shooter_pressure
-            or (stronger_closing and hp_frac < 0.82 and not kill_imminent)
+            or (stronger_closing and hp_frac < 0.82 and not can_commit_finish)
         )
 
         if self.mode == "RETREAT":
@@ -1705,9 +2583,20 @@ class MobileScavengerBot:
             obs, self_data, zone, active_enemies, t
         )
 
+        # Short window to collect safe cubes (or desired nearby weapon pickup) even while an enemy
+        # is tracked behind a wall: only when NO enemy has a clear shot at us (`len(shooters) == 0`),
+        # the cube/pickup is inside the zone and safe from enemy sightlines (`best_cube`), and within a quick dash.
+        quick_safe_cube = (
+            best_cube is not None
+            and len(shooters) == 0
+            and math.hypot(best_cube["pos"][0] - px, best_cube["pos"][1] - py) <= 28.0
+        )
+
         if self.mode != "RETREAT":
             if target_drop is not None:
                 self.mode = "DROP"
+            elif quick_safe_cube:
+                self.mode = "SCAVENGE"
             elif primary_enemy is not None and primary_enemy_dist < 175.0:
                 self.mode = "COMBAT"
             else:
@@ -1717,6 +2606,8 @@ class MobileScavengerBot:
         move_goal_x, move_goal_y = px, py
         want_boost = False
         want_jump = False
+        active_peek_pair: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None
+        peek_target_id: Optional[int] = None
 
         cx, cy = zone.get("center", [0.0, 0.0])
         cur_r = float(zone.get("radius", 560.0))
@@ -1765,7 +2656,9 @@ class MobileScavengerBot:
             dpos = target_drop["pos"]
             move_goal_x, move_goal_y = dpos[0], dpos[1]
         elif self.mode == "COMBAT" and primary_enemy is not None:
-            ex, ey, ez = primary_enemy.pos
+            combat_move_enemy = firing_enemy if firing_enemy is not None else primary_enemy
+            ex, ey, ez = combat_move_enemy.pos
+            edist = math.hypot(ex - px, ey - py)
             has_lightning = self.get_weapon_slot(self_data, "lightning")[0] is not None
             enemy_has_lightning = "lightning" in primary_enemy.weapons
 
@@ -1778,22 +2671,70 @@ class MobileScavengerBot:
 
             laser_slot, laser_w = self.get_weapon_slot(self_data, "laser")
             laser_charge = float(laser_w.get("charge", 0.0)) if laser_w else 0.0
-            laser_full = (
-                float(laser_w.get("stats", {}).get("charge", 0.75)) if laser_w else 0.75
+            laser_cd = float(laser_w.get("cooldown", 0.0)) if laser_w else 0.0
+            req_laser_charge, _ = (
+                self.compute_required_laser_charge(
+                    self_data,
+                    laser_w,
+                    "mech",
+                    combat_move_enemy.hp,
+                    combat_move_enemy.weapons,
+                )
+                if laser_w is not None
+                else (0.66, 315.0)
             )
 
-            if primary_enemy.charging:
-                cov_x, cov_y = self.select_cover_anchor(
-                    self_data, zone, active_enemies, t, force_break_los=True
+            # Coordinated laser peek-and-retreat pair (cover_pt, peek_pt) when enabled
+            peek_pair = (
+                self.select_laser_peek_pair(
+                    self_data, zone, combat_move_enemy, active_enemies, t
                 )
-                move_goal_x, move_goal_y = cov_x, cov_y
-            elif laser_w and 0.0 < laser_charge < laser_full * 0.78:
+                if (self.enable_laser_peek and laser_w is not None and not has_lightning)
+                else None
+            )
+            if peek_pair is not None:
+                active_peek_pair = peek_pair
+                peek_target_id = combat_move_enemy.id
+
+            if primary_enemy.charging:
+                if peek_pair is not None:
+                    move_goal_x, move_goal_y = peek_pair[0]
+                else:
+                    cov_x, cov_y = self.select_cover_anchor(
+                        self_data, zone, active_enemies, t, force_break_los=True
+                    )
+                    move_goal_x, move_goal_y = cov_x, cov_y
+            elif peek_pair is not None:
+                cov_pt, pk_pt = peek_pair
+                stats = self_data.get("stats", {})
+                mech_cfg = self.config.get("mech", {})
+                walk_spd = float(stats.get("walk_speed", mech_cfg.get("walk_speed", 11.7)))
+                charge_spd = max(3.0, walk_spd * 0.5)
+                dist_to_peek = math.hypot(pk_pt[0] - px, pk_pt[1] - py)
+                # Time required to step out at half charging speed to reach pk_pt
+                step_out_time = dist_to_peek / charge_spd
+                rem_charge_s = max(0.0, req_laser_charge - laser_charge)
+
+                # Start stepping out to `pk_pt` timed so we clear the corner right as charge finishes
+                # (never waiting until 100% full if step_out_time > 0.15s, which risks auto-fire!).
+                # While cooling down (`laser_cd > 0.10`) or not yet charging, hold `cov_pt`.
+                ready_to_peek = (
+                    laser_cd <= 0.10
+                    and t >= self.shorted_until_t
+                    and laser_charge > 0.0
+                    and rem_charge_s <= max(0.15, step_out_time - 0.05)
+                )
+                if ready_to_peek:
+                    move_goal_x, move_goal_y = pk_pt
+                else:
+                    move_goal_x, move_goal_y = cov_pt
+            elif laser_w and 0.0 < laser_charge < req_laser_charge * 0.85:
                 cov_x, cov_y = self.select_cover_anchor(
                     self_data, zone, active_enemies, t, force_break_los=True
                 )
                 move_goal_x, move_goal_y = cov_x, cov_y
             elif primary_enemy_dist < pref_min:
-                away_yaw = math.atan2(py - ey, px - ex)
+                away_yaw = math.atan2(py - primary_enemy.pos[1], px - primary_enemy.pos[0])
                 kite_x = px + math.cos(away_yaw) * 35.0
                 kite_y = py + math.sin(away_yaw) * 35.0
                 if self.is_inside_zone(kite_x, kite_y, zone, margin=12.0) and not self.world.is_point_blocked(
@@ -1804,7 +2745,7 @@ class MobileScavengerBot:
                     move_goal_x, move_goal_y = self.select_cover_anchor(
                         self_data, zone, active_enemies, t, force_break_los=False
                     )
-            elif primary_enemy_dist > pref_max:
+            elif edist > pref_max:
                 to_yaw = math.atan2(ey - py, ex - px)
                 move_goal_x = px + math.cos(to_yaw) * 28.0
                 move_goal_y = py + math.sin(to_yaw) * 28.0
@@ -1838,6 +2779,13 @@ class MobileScavengerBot:
                 move_goal_x, move_goal_y = self.select_cover_anchor(
                     self_data, zone, active_enemies, t, force_break_los=False
                 )
+
+        # Check for incoming mortar shell dodge override
+        mortar_dodge = self.evaluate_mortar_dodge(obs, self_data, zone)
+        if mortar_dodge is not None:
+            move_goal_x, move_goal_y, dodge_boost = mortar_dodge
+            if dodge_boost:
+                want_boost = True
 
         # Compute movement vector via A* pathfinding + local steering + stuck recovery
         move_cmd, active_path = self.compute_navigation_move(
@@ -1992,17 +2940,77 @@ class MobileScavengerBot:
                     )
 
                     if l_cur_charge <= 0.0:
-                        if not want_swap_laser and (has_los_to_target or tdist < 165.0):
-                            fire_cmd[laser_slot] = True
-                            self.laser_state = "CHARGING"
+                        # Start charging ONLY if we already have clear LOS, OR we have a reachable
+                        # firing position (`active_peek_pair`) whose peek point is close enough to reach
+                        # at half charging speed before `hold_s` auto-fires, OR (when peek is disabled)
+                        # the target is close enough to step into LOS.
+                        can_reach_peek_in_time = False
+                        if (
+                            active_peek_pair is not None
+                            and peek_target_id == combat_target["id"]
+                        ):
+                            cov_pt, pk_pt = active_peek_pair
+                            stats = self_data.get("stats", {})
+                            mech_cfg = self.config.get("mech", {})
+                            walk_spd = float(
+                                stats.get("walk_speed", mech_cfg.get("walk_speed", 11.7))
+                            )
+                            charge_spd = max(3.0, walk_spd * 0.5)
+                            l_hold_s = float(
+                                l_stats.get(
+                                    "hold_s",
+                                    self.config.get("weapons", {})
+                                    .get("laser", {})
+                                    .get("hold_s", 2.0),
+                                )
+                            )
+                            dist_to_peek = math.hypot(pk_pt[0] - px, pk_pt[1] - py)
+                            # Require we can comfortably walk from current pos to peek_pt before auto-fire
+                            can_reach_peek_in_time = (
+                                dist_to_peek / charge_spd
+                            ) <= (l_max_charge + l_hold_s * 0.55)
+
+                        if not want_swap_laser:
+                            if has_los_to_target:
+                                fire_cmd[laser_slot] = True
+                                self.laser_state = "CHARGING"
+                            elif self.enable_laser_peek:
+                                if can_reach_peek_in_time:
+                                    fire_cmd[laser_slot] = True
+                                    self.laser_state = "CHARGING"
+                            elif tdist < 165.0:
+                                fire_cmd[laser_slot] = True
+                                self.laser_state = "CHARGING"
                     else:
-                        req_charge = (
-                            l_max_charge * 0.96
-                            if combat_target["kind"] in ("crate", "npc")
-                            else l_max_charge * 0.88
+                        # Check if we are hitting the target's rear arc (1.5x damage multiplier)
+                        angle_from_target = math.atan2(py - tpos[1], px - tpos[0])
+                        target_aim_yaw = (
+                            float(target_enemy.aim[0])
+                            if (
+                                combat_target["kind"] == "mech"
+                                and target_enemy is not None
+                            )
+                            else 0.0
                         )
-                        if l_cur_charge >= l_max_charge * 0.68:
-                            # Priority to laser hitscan alignment as charge nears full
+                        rear_mult = (
+                            1.5
+                            if (
+                                combat_target["kind"] == "mech"
+                                and abs(angle_diff(target_aim_yaw, angle_from_target))
+                                > math.pi * 0.5
+                            )
+                            else 1.0
+                        )
+                        req_charge, _ = self.compute_required_laser_charge(
+                            self_data,
+                            laser_w,
+                            combat_target["kind"],
+                            float(combat_target.get("hp", 1400.0)) / rear_mult,
+                            combat_target.get("weapons", []),
+                            safety_margin=1.08,
+                        )
+                        if l_cur_charge >= min(l_max_charge * 0.68, req_charge * 0.82):
+                            # Priority to laser hitscan alignment as charge nears release threshold
                             desired_yaw, desired_pitch = hitscan_yaw, hitscan_pitch
 
                         if l_cur_charge >= req_charge and has_los_to_target and aim_aligned:
@@ -2055,7 +3063,12 @@ class MobileScavengerBot:
                         abs(angle_diff(actual_yaw, gun_yaw)) <= gun_yaw_tol
                         and abs(actual_pitch - gun_pitch) <= gun_pitch_tol
                     ):
-                        fire_cmd[gun_slot] = True
+                        lead_point = (lead_x, lead_y, lead_z)
+                        # A visible target can still reach cover before the bullet does.
+                        if lead_point == target_center or self.world.has_line_of_sight(
+                            *muzzle_pos, *lead_point
+                        ):
+                            fire_cmd[gun_slot] = True
 
             # --- MORTAR FALLBACK ---
             if (
@@ -2220,9 +3233,15 @@ class MobileScavengerBot:
 
 
 # Pin the active submission profile here or via `ENV BOT_PROFILE=...` in Dockerfile:
-#   "baseline"   -> Submission 1: Reliable baseline (threat-target only, 85% HP multi-retreat)
-#   "finishable" -> Submission 2: + Finishable-target selection (TTK-based firing target)
-#   "duelist"    -> Submission 3: + Immediate repositioning when 2+ shooters have LOS
+#   "baseline"        -> Reliable baseline (threat-target only, 85% HP multi-retreat)
+#   "finishable"      -> + Finishable-target selection (TTK-based firing target)
+#   "duelist"         -> + Immediate repositioning on 2+ shooters, safe cube pickup, ID upgrades,
+#                          and uncapped route-exposure escape planning before committing to a kill
+#   "duelist_lock"    -> duelist + burst target hysteresis (hold current target while aiming/charging)
+#   "duelist_route"   -> duelist + route-exposure cover scoring (avoid sprinting across firing lanes)
+#   "peek"            -> duelist + Laser peek-and-retreat pair & early lethal laser release
+#   "dodge_only"      -> duelist + Incoming mortar shell landing prediction & dodge
+#   "dodge"           -> duelist + Laser peek + Mortar dodge + hysteresis + route cover (all)
 DEFAULT_BOT_PROFILE = "duelist"
 
 
@@ -2233,16 +3252,73 @@ def main() -> None:
         bot = MobileScavengerBot(
             enable_finishable_targeting=False,
             enable_early_multi_reposition=False,
+            enable_laser_peek=False,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=False,
+            enable_route_exposure_cover=False,
         )
     elif profile in ("2", "finishable"):
         bot = MobileScavengerBot(
             enable_finishable_targeting=True,
             enable_early_multi_reposition=False,
+            enable_laser_peek=False,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=False,
+            enable_route_exposure_cover=False,
+        )
+    elif profile in ("3", "duelist"):
+        bot = MobileScavengerBot(
+            enable_finishable_targeting=True,
+            enable_early_multi_reposition=True,
+            enable_laser_peek=False,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=False,
+            enable_route_exposure_cover=False,
+        )
+    elif profile in ("duelist_lock", "lock"):
+        bot = MobileScavengerBot(
+            enable_finishable_targeting=True,
+            enable_early_multi_reposition=True,
+            enable_laser_peek=False,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=True,
+            enable_route_exposure_cover=False,
+        )
+    elif profile in ("duelist_route", "route"):
+        bot = MobileScavengerBot(
+            enable_finishable_targeting=True,
+            enable_early_multi_reposition=True,
+            enable_laser_peek=False,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=False,
+            enable_route_exposure_cover=True,
+        )
+    elif profile in ("4", "peek"):
+        bot = MobileScavengerBot(
+            enable_finishable_targeting=True,
+            enable_early_multi_reposition=True,
+            enable_laser_peek=True,
+            enable_mortar_dodge=False,
+            enable_target_hysteresis=True,
+            enable_route_exposure_cover=False,
+        )
+    elif profile in ("5", "dodge_only", "dodge-only"):
+        bot = MobileScavengerBot(
+            enable_finishable_targeting=True,
+            enable_early_multi_reposition=True,
+            enable_laser_peek=False,
+            enable_mortar_dodge=True,
+            enable_target_hysteresis=False,
+            enable_route_exposure_cover=False,
         )
     else:
         bot = MobileScavengerBot(
             enable_finishable_targeting=True,
             enable_early_multi_reposition=True,
+            enable_laser_peek=True,
+            enable_mortar_dodge=True,
+            enable_target_hysteresis=True,
+            enable_route_exposure_cover=True,
         )
     run_bot(
         bot_name="nanite-duelist",

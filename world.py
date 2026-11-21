@@ -848,10 +848,12 @@ class WorldMap:
         current scaled radius and height and validating every grid edge against narrow
         pillars. When `smooth=False` (e.g., distance-only scoring), skips waypoint
         reconstruction and string-pulling for maximum speed.
-        Returns (waypoints_world, total_path_distance_m).
+        Returns (waypoints_world, total_path_distance_m). An infinite distance
+        means the search did not find a route all the way to the goal. A partial
+        route can still provide a useful next move.
         """
         direct_dist = math.hypot(goal_x - start_x, goal_y - start_y)
-        if not self.loaded or self.nav_blocked is None or direct_dist < 2.5:
+        if not self.loaded or self.nav_blocked is None:
             return [(goal_x, goal_y)], direct_dist
 
         # Fast path: if direct line is completely walkable for current mech dimensions, no A* needed
@@ -867,7 +869,7 @@ class WorldMap:
             return [(goal_x, goal_y)], direct_dist
 
         if deadline_perf is not None and time.perf_counter() >= deadline_perf:
-            return [(goal_x, goal_y)], direct_dist * 3.0 + 400.0
+            return [], math.inf
 
         custom_cache = self._get_scaled_cache(mech_radius)
         edge_cache = self._get_edge_cache(mech_radius)
@@ -881,9 +883,19 @@ class WorldMap:
             gx0, gy0, max_r=5, mech_radius=mech_radius, mech_height=mech_height, custom_cache=custom_cache
         )
         if start_node is None or goal_node is None:
-            return [(goal_x, goal_y)], direct_dist * 2.5 + 500.0
-        if start_node == goal_node:
-            return [(goal_x, goal_y)], direct_dist
+            return [], math.inf
+
+        start_center = self._nav_world_pos(*start_node)
+        goal_center = self._nav_world_pos(*goal_node)
+        if not self.is_walkable_segment_2d(
+            start_x, start_y, *start_center, mech_radius, mech_height
+        ):
+            return [], math.inf
+        goal_connected = self.is_walkable_segment_2d(
+            *goal_center, goal_x, goal_y, mech_radius, mech_height
+        )
+        if not goal_connected and not smooth:
+            return [], math.inf
 
         nx = self.nav_nx
         ny = self.nav_ny
@@ -982,9 +994,14 @@ class WorldMap:
                         best_idx = n_idx
                     heapq.heappush(open_heap, (tentative_g + h * 1.05, n_idx))
 
-        total_dist = g_score.get(best_idx, 0.0) * self.nav_step
-        if not reached:
-            total_dist += best_h * self.nav_step * 2.5 + 250.0
+        complete = reached and goal_connected
+        total_dist = (
+            g_score[goal_idx] * self.nav_step
+            + math.hypot(start_center[0] - start_x, start_center[1] - start_y)
+            + math.hypot(goal_x - goal_center[0], goal_y - goal_center[1])
+            if complete
+            else math.inf
+        )
 
         # When caller only needs distance (e.g., reachable_distance for loot/cover scoring),
         # skip path reconstruction and string-pulling completely.
@@ -1000,26 +1017,14 @@ class WorldMap:
             curr = came_from[curr]
         raw_cells.reverse()
 
-        if not raw_cells:
-            return [(goal_x, goal_y)], direct_dist * 2.5 + 500.0
+        if not raw_cells and not complete:
+            return [], math.inf
 
-        raw_pts: List[Tuple[float, float]] = [
+        raw_pts = [start_center] + [
             self._nav_world_pos(cx, cy) for cx, cy in raw_cells
         ]
-        # Replace final grid center with exact goal_x, goal_y ONLY if the segment from
-        # the preceding grid point (or start) to (goal_x, goal_y) is genuinely walkable
-        if reached:
-            prev_wx, prev_wy = raw_pts[-2] if len(raw_pts) >= 2 else (start_x, start_y)
-            if self.is_walkable_segment_2d(
-                prev_wx,
-                prev_wy,
-                goal_x,
-                goal_y,
-                mech_radius=mech_radius,
-                mech_height=mech_height,
-                step_m=1.6,
-            ):
-                raw_pts[-1] = (goal_x, goal_y)
+        if complete and raw_pts[-1] != (goal_x, goal_y):
+            raw_pts.append((goal_x, goal_y))
 
         # String-pulling / path smoothing using current mech dimensions
         # Every single-step grid edge in raw_pts was already validated during A* expansion!
@@ -1062,8 +1067,8 @@ class WorldMap:
         deadline_perf: Optional[float] = None,
     ) -> float:
         """
-        Returns reachable travel distance in meters between start and goal
-        for the current mech dimensions without building or smoothing waypoints.
+        Returns travel distance in meters, or infinity if the goal was not reached.
+        Skips reconstructing and smoothing waypoints.
         """
         _, dist = self.find_path_astar(
             start_x,
